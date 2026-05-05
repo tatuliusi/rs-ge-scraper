@@ -2,3 +2,4 @@ venv
 .env
 .idea
 ./claude
+app/__pycache__/
