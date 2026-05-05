@@ -1,0 +1,7 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+requests>=2.31.0
+selenium>=4.0.0
+undetected-chromedriver>=3.5.0
+setuptools
+beautifulsoup4>=4.12.0
