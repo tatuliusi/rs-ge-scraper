@@ -1,0 +1,1 @@
+# RS.ge scraper architecture
