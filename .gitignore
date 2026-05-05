@@ -1,5 +1,7 @@
 venv
 .env
 .idea
-./claude
+.claude
 app/__pycache__/
+app/models/__pycache__/
+app/scraper/__pycache__/
