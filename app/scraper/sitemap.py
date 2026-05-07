@@ -1,130 +1,108 @@
+"""
+Seed URL discovery — two sources:
+  1. rs.ge/SiteMap  (HTML sitemap listing all top-level pages)
+  2. infohub.rs.ge  (paginated article search endpoints)
+"""
 import logging
+from typing import List
+
 import requests
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-_BASE = "https://rs.ge"
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
 _SITEMAP_URL = "https://rs.ge/SiteMap"
+_INFOHUB_SEARCH = "https://infohub.rs.ge/ka/search"
+_INFOHUB_TYPES = [57, 64]
 
-_SKIP_PREFIXES = (
-    "tel:", "mailto:", "javascript:",
-    "https://www.youtube.", "https://www.facebook.",
-    "http://asycuda.", "http://newzone.", "http://www.revenue.",
-)
-
-_SKIP_PATHS = {
-    "/", "/gallery", "/Vacancy", "/EmailUs", "/SiteMap",
-    "/PublicInfo", "/Contact", "/VideoInstructions",
-}
-
-_RELEVANT_PATH_PREFIXES = (
-    "/PersonsTaxes",
-    "/PersonsPreferentialTax",
-    "/PersonsTaxAdministration",
-    "/PersonsAccountingDocuments",
-    "/PersonsTaxFAQ",
-    "/PersonsRights",
-    "/LegalEntityTaxes",
-    "/LegalEntityPreferentialTax",
-    "/LegalEntityTaxAdministration",
-    "/LegalEntityAccountingDocuments",
-    "/LegalEntityTaxFAQ",
-    "/LegalEntityRights",
-    "/Legislation",
-    "/TaxPayer",
-    "/SituationalManuals",
-    "/TaxPrivileges",
-    "/PayerPermissions",
-    "/UsefulInformation",
-    "/PreliminaryDecision",
-    "/Agreements",
-    "/ApplicationForms",
-    "/OrdersoftheHeadoftheRevenueService",
-    "/MountainRegion",
-    "/CompanyStatus",
-    "/CharityOrganization",
-)
+_SKIP = ["/gallery", "/Vacancy", "/vacancy", "/EmailUs", "/Contact",
+         "/login", "/register", "/print"]
+_SKIP_DOMAINS = ["youtube.com", "facebook.com", "twitter.com",
+                 "asycuda.org", "google.com"]
 
 
-def fetch_sitemap_urls() -> list[str]:
-    response = requests.get(_SITEMAP_URL, timeout=15)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-    return [link["href"] for link in soup.find_all("a") if link.get("href")]
+# ---------------------------------------------------------------------------
+# Public
+# ---------------------------------------------------------------------------
+
+def get_all_seed_urls() -> List[str]:
+    logger.info("Fetching sitemap…")
+    sitemap = _fetch_sitemap()
+    logger.info("  %d URLs from sitemap", len(sitemap))
+
+    logger.info("Fetching infohub…")
+    infohub = _fetch_infohub_all()
+    logger.info("  %d URLs from infohub", len(infohub))
+
+    combined = list(set(sitemap + infohub))
+    logger.info("Total seed URLs: %d", len(combined))
+    return combined
 
 
-def clean_urls(urls: list[str]) -> list[str]:
-    cleaned = set()
-    for url in urls:
-        if any(url.startswith(p) for p in _SKIP_PREFIXES):
-            continue
+# ---------------------------------------------------------------------------
+# Private
+# ---------------------------------------------------------------------------
 
-        if url.startswith("/"):
-            if url in _SKIP_PATHS:
-                continue
-            if not any(url.startswith(p) for p in _RELEVANT_PATH_PREFIXES):
-                continue
-            cleaned.add(_BASE + url)
-
-        elif url.startswith(f"{_BASE}/"):
-            path = url[len(_BASE):]
-            if path in _SKIP_PATHS:
-                continue
-            if not any(path.startswith(p) for p in _RELEVANT_PATH_PREFIXES):
-                continue
-            cleaned.add(url)
-
-        elif url.startswith("https://infohub.rs.ge"):
-            cleaned.add(url)
-
-    return sorted(cleaned)
+def _fetch_sitemap() -> List[str]:
+    try:
+        resp = requests.get(_SITEMAP_URL, timeout=15, headers={"User-Agent": _USER_AGENT})
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+        return [
+            a["href"].strip()
+            for a in soup.find_all("a", href=True)
+            if _keep(a["href"].strip())
+        ]
+    except Exception as exc:
+        logger.error("Sitemap fetch failed: %s", exc)
+        return []
 
 
-def get_infohub_article_urls() -> list[str]:
-    """Paginate through infohub search results and collect individual article URLs."""
-    article_urls = set()
-    search_bases = [
-        "https://infohub.rs.ge/ka/search?types=57",
-        "https://infohub.rs.ge/ka/search?types=64",
-    ]
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; rs-ge-scraper/1.0)"}
-
-    for base in search_bases:
+def _fetch_infohub_all() -> List[str]:
+    urls: List[str] = []
+    for t in _INFOHUB_TYPES:
         page = 1
-        consecutive_empty = 0
-        while consecutive_empty < 2:
-            url = f"{base}&page={page}"
-            try:
-                resp = requests.get(url, timeout=15, headers=headers)
-                resp.raise_for_status()
-                soup = BeautifulSoup(resp.text, "html.parser")
-                found = [
-                    "https://infohub.rs.ge" + l["href"]
-                    for l in soup.find_all("a", href=True)
-                    if l["href"].startswith("/ka/article/")
-                    or l["href"].startswith("/ka/news/")
-                ]
-                if not found:
-                    consecutive_empty += 1
-                else:
-                    consecutive_empty = 0
-                    article_urls.update(found)
-                    logger.info(f"infohub page {page}: found {len(found)} articles")
-                page += 1
-            except Exception as e:
-                logger.warning(f"Failed fetching infohub {url}: {e}")
+        while page <= 200:          # hard safety cap
+            batch = _fetch_infohub_page(t, page)
+            if not batch:
                 break
+            urls.extend(batch)
+            page += 1
+    return list(set(urls))
 
-    return sorted(article_urls)
+
+def _fetch_infohub_page(article_type: int, page: int) -> List[str]:
+    try:
+        resp = requests.get(
+            _INFOHUB_SEARCH,
+            params={"types": article_type, "page": page},
+            timeout=15,
+            headers={"User-Agent": _USER_AGENT},
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+        links = [
+            a["href"].strip()
+            for a in soup.find_all("a", href=True)
+            if "/ka/" in a["href"] and "infohub.rs.ge" in a["href"]
+        ]
+        return links
+    except Exception as exc:
+        logger.warning("Infohub page %d type %d failed: %s", page, article_type, exc)
+        return []
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    urls = fetch_sitemap_urls()
-    clean = clean_urls(urls)
-    print(f"rs.ge relevant pages: {len(clean)}")
-    for u in clean:
-        print(" ", u)
-    infohub = get_infohub_article_urls()
-    print(f"\ninfohub articles: {len(infohub)}")
+def _keep(url: str) -> bool:
+    if not url.startswith("http"):
+        return False
+    if any(s in url for s in _SKIP):
+        return False
+    if any(d in url for d in _SKIP_DOMAINS):
+        return False
+    return True
